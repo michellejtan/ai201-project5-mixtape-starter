@@ -1,4 +1,9 @@
 # Project 5: Mixtape Bug Hunt Submission
+# AI Assistance
+
+I used ChatGPT for two specific purposes on this project. First, I asked it to help me understand the overall Flask/SQLAlchemy architecture (e.g. how the app factory and blueprint registration in `app.py` fit together, and what `outerjoin` does against an association table) so I could read unfamiliar code faster before tracing bugs myself. Second, for Bug Fixes 1, 4, and 5, I asked ChatGPT to draft `flask shell` scripts I could use to reproduce each bug (creating users/songs, calling the buggy function, printing the result).
+
+The scripts ChatGPT produced were not directly runnable against this project's actual data — it used placeholder/generic values (e.g. `song1 = Song.query.get(1)`, `create_playlist("Bug Test Playlist", "1")`), since it had no visibility into the real seeded database. Before running them, I had to query the actual `User`/`Song`/`Playlist` records myself (as shown in the `flask shell` output under Bug Fix 1 and Bug Fix 4) and substitute the real UUIDs and IDs from this project in place of ChatGPT's generic placeholders. The reproduction steps recorded under each bug fix reflect that corrected, project-specific version of the script, not what ChatGPT originally generated. I reproduced each bug myself, traced the relevant execution flow through the route and service layers, and implemented and verified the fixes locally — AI was used for scaffolding and architectural understanding, not for generating the fixes themselves.
 
 # Codebase Map
 
@@ -688,12 +693,53 @@ tests) still passes.
 
 ---
 
-# Regression Test (Stretch)
+# Regression Tests (Stretch)
 
-*(Describe the regression test you added and why it would have caught the bug.)*
+Four issues now have regression tests in `tests/`, covering all bugs fixed in
+this project. Two already existed in the starter repo; two (`test_feed.py`,
+`test_notifications.py`) I added for this stretch goal.
+
+## Already present (Issues #1 and #5)
+
+- **`tests/test_streaks.py::test_streak_increments_on_sunday`** — creates a
+  user, calls `update_listening_streak()` on a Saturday then a Sunday one
+  calendar day apart, and asserts the streak goes from 1 to 2. Against the
+  pre-fix code (`elif days_since_last == 1 and today.weekday() != 6:`), the
+  `weekday() != 6` clause is `False` on a Sunday regardless of
+  `days_since_last`, so the `elif` doesn't match, the `else` branch runs, and
+  the streak resets to 1 — this test would have failed with `assert 1 == 2`.
+- **`tests/test_playlists.py::test_playlist_returns_all_songs`** — seeds a
+  playlist with 5 songs at positions 1–5 and asserts `get_playlist_songs()`
+  returns all 5 (comment in the test literally notes "Bug causes this to
+  return 4"). Against the pre-fix code (`return [song.to_dict() for song in
+  songs[:-1]]`), the last-positioned song is always sliced off, so this test
+  would have failed with `assert 4 == 5`.
+
+## Added for this stretch goal (Issues #2 and #4)
+
+- **`tests/test_feed.py::test_friend_listening_2_hours_ago_is_not_shown`** —
+  logs a `ListeningEvent` for a friend timestamped 2 hours in the past and
+  asserts `get_friends_listening_now()` returns `[]`. I verified this against
+  the pre-fix code by temporarily restoring `RECENT_THRESHOLD =
+  timedelta(hours=24)`: the 2-hour-old event still satisfies `listened_at >=
+  cutoff` under a 24-hour window, so the friend is wrongly included and the
+  test fails with `assert [...] == []`. A companion test,
+  `test_friend_listening_5_minutes_ago_is_shown`, pins down the other side of
+  the boundary so the window can't just be shrunk to zero.
+- **`tests/test_notifications.py::test_rating_a_song_notifies_the_sharer`** —
+  has one user rate another's shared song via `rate_song()`, then asserts
+  `get_notifications()` for the sharer returns exactly one `song_rated`
+  notification. I verified this against the pre-fix code by temporarily
+  removing the `create_notification()` call from the end of `rate_song()`:
+  with no notification ever created, `get_notifications()` returns `[]` and
+  the test fails with `assert 0 == 1`. Two companion tests
+  (`test_rating_your_own_song_does_not_notify_you` and
+  `test_adding_to_playlist_still_notifies_the_sharer`) confirm the self-rating
+  exemption and the pre-existing playlist notification path both still work
+  after the fix.
+
+I confirmed all four regression tests fail against their respective pre-fix
+implementations and pass against the fixed code, then ran the full
+`pytest tests/` suite (19 tests) to confirm no regressions elsewhere.
 
 ---
-
-# AI Assistance
-
-I used ChatGPT to help me understand the overall architecture of the project, explain unfamiliar functions, and organize my codebase map and bug documentation. I reproduced each bug myself, traced the relevant execution flow through the route and service layers, implemented and verified the fixes locally, and used AI as a tool for understanding the existing code rather than generating the fixes automatically.
