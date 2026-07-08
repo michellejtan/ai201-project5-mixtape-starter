@@ -121,6 +121,29 @@ While exploring the project, I noticed several consistent architectural patterns
 - Several many-to-many relationships are implemented using association tables, with `playlist_entries` storing additional metadata beyond the relationship itself.
 
 ---
+# Investigation Note: Issue #3, First Pass
+
+I initially attempted to reproduce Issue #3 ("the same song keeps showing
+up twice in search"). `search_service.search_songs()` does an `outerjoin`
+against the `song_tags` association table without ever using it in the
+filter — the suspected bug is that joining a many-to-many table fans out
+one row per matching tag, so a song with 2+ tags would be fetched multiple
+times.
+
+However, running the existing `tests/test_search.py` against the
+unmodified (still-joined) service function shows all 5 tests passing,
+including the ones written specifically to catch the duplicate. I also
+reproduced this directly: a song with 3 tags returned exactly 1 result
+from `search_songs()`, not 3. This is because SQLAlchemy 2.0's legacy
+`Query` API auto-deduplicates full-entity results by primary key even when
+the underlying SQL join fans out rows (confirmed the raw SQL join does
+return 3 rows; the ORM layer collapses them to 1 before `to_dict()` is
+called). At this point I could not trigger the reported behavior through
+`search_songs()` as it's currently called, so I moved on to the other
+issues rather than get stuck — see **Bug Fix 3** below for the follow-up
+that found a real, if currently latent, defect behind this join.
+
+---
 # Bug Fix 1
 
 ## Issue
@@ -311,5 +334,96 @@ Full `pytest tests/` suite (13 tests) still passes.
 ## Commit
 
 `fix: shrink Friends Listening Now window from 24h to 30min`
+
+---
+# Bug Fix 3
+
+## Issue
+
+Issue #3: "The same song keeps showing up twice in search." As noted in
+the investigation note above, this couldn't be reproduced through the
+current call path — but a real defect was still present in the query.
+
+## How I Reproduced It
+
+The first-pass reproduction attempt (see the investigation note) showed
+that `search_songs()`, called plainly with no `LIMIT`/`OFFSET`, returns
+exactly one result per song regardless of tag count, because SQLAlchemy's
+legacy `Query` API deduplicates full-entity results by primary key even
+when the underlying SQL fans out multiple rows per song.
+
+To find a case where that auto-dedup doesn't save you, I simulated adding
+pagination (`.limit(2)`) to the same query, which is a realistic future
+change for a search endpoint. With the `outerjoin` against `song_tags`
+still in place, `LIMIT` is applied by the database to the raw (fanned-out)
+SQL rows *before* the ORM collapses duplicates in Python — so a single
+multi-tag song can consume more than one row of the limit budget:
+
+```
+With outerjoin + limit(2):    ['Crown Heights Anthem']
+Without outerjoin + limit(2): ['Crown Heights Anthem', 'Zzz Other']
+```
+
+A 3-tag song alone filled the 2-row limit, so a second, genuinely
+different song ("Zzz Other") that should have appeared in the results was
+silently dropped — this reproduces the family of bug the issue describes
+(a multi-tag song distorting how many "slots" a song search actually
+returns), just via pagination instead of a bare `.all()`.
+
+## How I Found the Root Cause
+
+Files examined: `services/search_service.py` (the query itself) and
+`tests/test_search.py` (to see what behavior was already specified).
+`search_songs()` builds `db.session.query(Song).outerjoin(song_tags, ...)`
+but the `.filter()` right below it only references `Song.title` and
+`Song.artist` — `song_tags` is never used in the `WHERE` clause. Checking
+`Song.to_dict()` confirmed tags are already loaded through the
+`Song.tags` relationship, so the join wasn't needed to build the response
+either. The moment I applied `.limit()` to both the joined and un-joined
+versions of the query side-by-side and saw the row counts diverge, I had
+confirmation the join was the actual defect, not just an unnecessary
+join — it was quietly relying on ORM behavior (Python-side dedup) that
+only helps if you fetch every matching row.
+
+## The Root Cause
+
+`search_songs()` performed an `outerjoin` against the `song_tags`
+association table that isn't used anywhere in its filter, purely as a
+leftover/unnecessary join. Joining a many-to-many table produces one SQL
+row per matching tag, so a song with N tags contributes N rows to the raw
+result set. With no `LIMIT`, SQLAlchemy's ORM happens to deduplicate
+full-entity rows by primary key before returning them, which is why the
+reported duplication couldn't be reproduced directly. But that dedup
+happens in Python after the database has already applied any `LIMIT`, so
+the underlying row fan-out is a real, load-bearing defect that surfaces
+the instant pagination is introduced (or if a raw/Core query is ever used
+instead of the ORM's `Query` API).
+
+## Fix and Side-Effect Check
+
+Removed the unnecessary `.outerjoin(song_tags, Song.id ==
+song_tags.c.song_id)` call from `search_songs()` in
+`services/search_service.py`, along with the now-unused `Tag`/`song_tags`
+imports. The filter only ever needed `Song.title`/`Song.artist`, and tags
+are populated separately via the `Song.tags` relationship inside
+`to_dict()`, so nothing else depends on the join.
+
+I re-ran the full `tests/test_search.py` suite (covers 0-tag, 1-tag, and
+3-tag songs) to confirm no regression, and re-ran the `.limit(2)`
+simulation from the reproduction step without the join to confirm the
+correct, non-fanned-out song is returned instead.
+
+## Verification
+
+```
+Without outerjoin + limit(2): ['Crown Heights Anthem', 'Zzz Other']
+```
+
+`pytest tests/test_search.py` — 5/5 passed. Full `pytest tests/` suite
+(13 tests) also passes.
+
+## Commit
+
+`fix: remove unnecessary song_tags join from search query`
 
 ---
