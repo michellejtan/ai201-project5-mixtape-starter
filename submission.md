@@ -236,3 +236,80 @@ checked both sides of the boundary and the other branch directly:
 `fix: remove Sunday weekday check from streak increment condition`
 
 ---
+# Bug Fix 2
+
+## Issue
+
+Issue #2: "Friends Listening Now shows people from yesterday." The
+"listening now" feed is supposed to show friends who are currently
+listening, but it kept surfacing friends who had listened at any point in
+the last 24 hours.
+
+## How I Reproduced It
+
+`routes/feed.py` calls `get_friends_listening_now()` in
+`services/feed_service.py`. That function builds a `cutoff` timestamp as
+`datetime.now(timezone.utc) - RECENT_THRESHOLD` and only includes
+`ListeningEvent`s at or after `cutoff`. `RECENT_THRESHOLD` was defined at
+the top of the file as `timedelta(hours=24)`.
+
+To trigger it, I created a `me`/`friend` pair, recorded a `ListeningEvent`
+for `friend` timestamped 2 hours in the past (clearly not "right now" by
+any reasonable definition of a listening session), and called
+`get_friends_listening_now(me.id)`. Expected: an empty list, since the
+friend isn't listening now. Actual: the friend showed up in the result,
+because 2 hours is well inside a 24-hour window.
+
+```
+Friend listened 2h ago -> shown as listening now: True
+BUG REPRODUCED: a friend who listened hours ago is shown as listening "now"
+```
+
+## How I Found the Root Cause
+
+I started at `routes/feed.py`, traced the "listening now" endpoint to
+`get_friends_listening_now()` in `services/feed_service.py`, and read the
+query top-down: it filters `ListeningEvent.listened_at >= cutoff` where
+`cutoff = now - RECENT_THRESHOLD`. The filter logic and dedup-by-friend
+loop below it were both correct — the only place "now" was defined was the
+`RECENT_THRESHOLD` constant itself, set to `timedelta(hours=24)`. A feed
+named "Listening Now" using a 24-hour window is the mismatch: the query
+logic isn't buggy, the threshold value it's built on is just far too wide
+for what the feature is supposed to mean.
+
+## The Root Cause
+
+`RECENT_THRESHOLD` in `services/feed_service.py` was set to
+`timedelta(hours=24)`. Any friend who had listened to anything at any
+point in the last full day — not just "right now" — passed the
+`listened_at >= cutoff` filter and was shown in the "Friends Listening
+Now" feed. There was no logic bug in the filtering or dedup code; the
+threshold constant itself just didn't match the feature's intent.
+
+## Fix and Side-Effect Check
+
+Changed `RECENT_THRESHOLD` from `timedelta(hours=24)` to
+`timedelta(minutes=30)` in `services/feed_service.py`, so the feed only
+reflects genuinely recent (session-scale) listening activity.
+
+I checked `get_activity_feed()` in the same file, since it also queries
+`ListeningEvent` for friends — it doesn't reference `RECENT_THRESHOLD` at
+all (its docstring explicitly says it's "not filtered by recency"), so it
+is unaffected by this change. I verified both sides of the new boundary:
+a friend who listened 2 hours ago is now correctly excluded, and a friend
+who listened 5 minutes ago is still correctly included.
+
+## Verification
+
+```
+Friend listened 2h ago -> shown as listening now: False (expect False)
+Friend listened 5min ago -> shown as listening now: True (expect True)
+```
+
+Full `pytest tests/` suite (13 tests) still passes.
+
+## Commit
+
+`fix: shrink Friends Listening Now window from 24h to 30min`
+
+---

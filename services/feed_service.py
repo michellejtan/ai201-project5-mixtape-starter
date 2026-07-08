@@ -10,7 +10,14 @@ from app import db
 from models import User, Song, ListeningEvent
 
 
-RECENT_THRESHOLD = timedelta(hours=24)
+# Bug fix: this was previously timedelta(hours=24), which is far too wide
+# a window for a "listening now" / presence feature — anyone a friend
+# listened to at any point in the last day was shown as listening "now".
+# A short window that approximates an actual listening session keeps the
+# feed limited to genuinely current activity.
+# A "listening now" presence window should cover an active session, not
+# an entire day.
+RECENT_THRESHOLD = timedelta(minutes=30)
 
 
 def get_friends_listening_now(user_id: str) -> list[dict]:
