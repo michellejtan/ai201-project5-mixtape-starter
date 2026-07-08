@@ -427,3 +427,112 @@ Without outerjoin + limit(2): ['Crown Heights Anthem', 'Zzz Other']
 `fix: remove unnecessary song_tags join from search query`
 
 ---
+# Bug Fix 4
+
+## Issue
+
+Issue #4: "I got notified when a friend added my song to a playlist but not
+when they rated it." Rating a song silently updates the `Rating` row but
+never notifies the song's original sharer, unlike `add_to_playlist()`,
+which does notify.
+
+## How I Reproduced It
+
+In `services/notification_service.py`, `rate_song()` looks up the song and
+rater, creates/updates the `Rating` row, commits, and returns — it never
+calls `create_notification()`. Compare to `add_to_playlist()` just above
+it, which explicitly calls `create_notification()` after adding the song.
+
+To trigger it, I created a `sharer` user who shares a song and a separate
+`rater` user, called `rate_song(rater.id, song.id, 5)`, then called
+`get_notifications(sharer.id)`. Expected: one `song_rated` notification for
+the sharer. Actual: empty list — no notification was created at all.
+
+```
+Notifications for sharer after rating: []
+BUG REPRODUCED: sharer got no notification for the rating
+```
+>>> from models import User, Song
+>>> from services.notification_service import rate_song, get_notifications
+>>> from app import db
+>>> 
+>>> for user in User.query.all():
+...      print(user.id, user.username)
+... 
+56db9ce4-ee3b-4f97-8418-88459b35cefc nova
+a4c20af5-0419-4345-92a3-3d5244dfa61d darius
+6ba98f19-e1ea-43b9-b979-0dcf7035dac1 simone
+29a03c95-011a-4a0d-af53-c08cec401888 kenji
+ea5dab2d-1004-4637-ae3f-3216d7a63d9e aaliya
+>>> for song in Song.query.all():
+...      print(song.id, song.title, song.shared_by)
+... 
+3f5b724f-cab9-4084-b66c-866c231ebfb3 Midnight Drive 56db9ce4-ee3b-4f97-8418-88459b35cefc
+926f6c09-0a95-40c8-914e-b7993cc0b577 Still Waters 56db9ce4-ee3b-4f97-8418-88459b35cefc
+b122e256-8649-48ca-9968-7d7aa8d7e404 First Light 56db9ce4-ee3b-4f97-8418-88459b35cefc
+3cf3958c-39bc-4d2f-b86e-06546053017e Block Party a4c20af5-0419-4345-92a3-3d5244dfa61d
+e9ad6c56-19cf-478e-9a8d-f0d099fc25e4 Late Night Session a4c20af5-0419-4345-92a3-3d5244dfa61d
+14ff34ce-7f32-4432-b1c8-aa90aeedd3b1 Golden Hour a4c20af5-0419-4345-92a3-3d5244dfa61d
+1dd4a1df-abc0-4802-9138-e78c30c5da42 Free Throws a4c20af5-0419-4345-92a3-3d5244dfa61d
+147ae1c3-0b6d-4340-a525-b0a38180df0d Soft Landing a4c20af5-0419-4345-92a3-3d5244dfa61d
+0f5ec406-b0d1-476b-a8d8-a7240c392148 Crown Heights Anthem 6ba98f19-e1ea-43b9-b979-0dcf7035dac1
+3b1a2e38-97ac-4b02-b685-02bcaa2b400c Harlem Renaissance 6ba98f19-e1ea-43b9-b979-0dcf7035dac1
+9747c5a9-769f-4999-9328-244d0648b0e5 After Hours 6ba98f19-e1ea-43b9-b979-0dcf7035dac1
+15c3c667-b27f-4dd7-a976-6665210de37d Lagos to London 6ba98f19-e1ea-43b9-b979-0dcf7035dac1
+8a30bcbb-fa96-43df-8902-75dc617deeb7 Frequencies 6ba98f19-e1ea-43b9-b979-0dcf7035dac1
+>>> rate_song("29a03c95-011a-4a0d-af53-c08cec401888", "147ae1c3-0b6d-4340-a525-b0a38180df0d",3.5)
+<Rating 44bad888-fbdf-491c-ad90-5dbdf2677f86>
+>>> get_notifications("a4c20af5-0419-4345-92a3-3d5244dfa61d")
+>>> []
+
+## How I Found the Root Cause
+
+Files examined: `routes/songs.py` (to see the `/songs/<id>/rate` route
+calls `rate_song()`), then `services/notification_service.py`. Reading
+`rate_song()` top-to-bottom: it looks up the song and rater, creates or
+updates the `Rating` row, calls `db.session.commit()`, and returns — that
+`return rating` is the last line in the function. Scrolling up to the
+sibling function `add_to_playlist()`, defined just above it in the same
+file, showed the pattern this function was missing: after its own
+`db.session.commit()`, it explicitly calls `create_notification(user_id=
+song.shared_by, ...)`. `rate_song()` has no equivalent call anywhere in
+its body — that absence, not a wrong condition, is the bug.
+
+## Root Cause
+
+`rate_song()` in `services/notification_service.py` persists the `Rating`
+row and commits, but never calls `create_notification()` for the song's
+sharer — unlike `add_to_playlist()` in the same file, which notifies the
+sharer immediately after adding a song. There's no conditional logic
+error here; the notification call is simply absent from this function
+entirely, so rating a song never produces a `song_rated` notification for
+anyone, regardless of who rates it.
+
+## Fix
+
+Added a `create_notification()` call at the end of `rate_song()` in
+`services/notification_service.py`, mirroring `add_to_playlist()`'s
+pattern: it notifies `song.shared_by` with a `song_rated` notification
+containing the rater's username, the song title, and the score, and skips
+notifying when `song.shared_by == user_id` (rating your own song).
+
+## Verification
+
+```
+Sharer notified after rating by someone else: 1 song_rated
+Notifications after self-rating (should still be 1): 1
+```
+
+Confirmed the sharer gets exactly one notification after a friend rates
+their song, and that self-rating does not add a spurious notification
+(matching `add_to_playlist()`'s existing self-add exemption). Checked
+`add_to_playlist()` itself and `get_notifications()`/`mark_as_read()` —
+none of them read or depend on `rate_song()`'s return value or side
+effects, so this addition doesn't affect other notification flows. Full
+`pytest tests/` suite (13 tests) still passes.
+
+## Commit
+
+`fix: notify song sharer when their song is rated`
+
+---
