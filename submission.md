@@ -121,6 +121,7 @@ While exploring the project, I noticed several consistent architectural patterns
 - Several many-to-many relationships are implemented using association tables, with `playlist_entries` storing additional metadata beyond the relationship itself.
 
 ---
+
 # Investigation Note: Issue #3, First Pass
 
 I initially attempted to reproduce Issue #3 ("the same song keeps showing
@@ -144,6 +145,7 @@ issues rather than get stuck — see **Bug Fix 3** below for the follow-up
 that found a real, if currently latent, defect behind this join.
 
 ---
+
 # Bug Fix 1
 
 ## Issue
@@ -259,6 +261,7 @@ checked both sides of the boundary and the other branch directly:
 `fix: remove Sunday weekday check from streak increment condition`
 
 ---
+
 # Bug Fix 2
 
 ## Issue
@@ -336,6 +339,7 @@ Full `pytest tests/` suite (13 tests) still passes.
 `fix: shrink Friends Listening Now window from 24h to 30min`
 
 ---
+
 # Bug Fix 3
 
 ## Issue
@@ -427,6 +431,7 @@ Without outerjoin + limit(2): ['Crown Heights Anthem', 'Zzz Other']
 `fix: remove unnecessary song_tags join from search query`
 
 ---
+
 # Bug Fix 4
 
 ## Issue
@@ -536,3 +541,159 @@ effects, so this addition doesn't affect other notification flows. Full
 `fix: notify song sharer when their song is rated`
 
 ---
+
+# Bug Fix 5
+
+## Issue
+
+Issue #5: "The last song in a playlist never shows up." Viewing a
+playlist's songs is always missing the last track by position, regardless
+of playlist length.
+
+## How I Reproduced It
+
+In `services/playlist_service.py`, `get_playlist_songs()` orders playlist
+entries by position ascending, then does `songs[:-1]` before converting to
+dicts — unconditionally dropping the last element of the ordered list, even
+though the function's own docstring says it "returns all songs in the
+playlist."
+
+To trigger it, I created a playlist with 4 songs (`Song A`–`Song D`) added
+at positions 1–4, then called `get_playlist_songs(playlist.id)`. Expected:
+all 4 songs, ending with `Song D`. Actual: only 3 songs returned, `Song D`
+missing.
+
+```
+Playlist has 4 songs: ['Song A', 'Song B', 'Song C', 'Song D']
+get_playlist_songs returned 3: ['Song A', 'Song B', 'Song C']
+BUG REPRODUCED: last song ('Song D') missing from result
+```
+>>> from models import User, Song
+>>> from models import Playlist
+>>> from services.playlist_service import create_playlist, get_playlist_songs
+>>> from app import db
+>>> from models import Playlist, playlist_entries
+>>> playlist_id = "c24189b2-0a57-4553-9e5b-ac23a5054562"
+>>> playlist = db.session.get(Playlist, playlist_id)
+>>> for song in playlist.songs:
+...     print("-", song.title)
+... 
+>>> playlist.songs
+[]
+>>> # Add four songs with positions 1-4
+>>> db.session.execute(
+...     playlist_entries.insert(),
+...     [
+...         {
+...             "playlist_id": playlist_id,
+...             "song_id": "3f5b724f-cab9-4084-b66c-866c231ebfb3",
+...             "position": 1,
+...             "added_by": "56db9ce4-ee3b-4f97-8418-88459b35cefc",
+...         },
+...         {
+...             "playlist_id": playlist_id,
+...             "song_id": "926f6c09-0a95-40c8-914e-b7993cc0b577",
+...             "position": 2,
+...             "added_by": "56db9ce4-ee3b-4f97-8418-88459b35cefc",
+...         },
+...         {
+...             "playlist_id": playlist_id,
+...             "song_id": "b122e256-8649-48ca-9968-7d7aa8d7e404",
+...             "position": 3,
+...             "added_by": "56db9ce4-ee3b-4f97-8418-88459b35cefc",
+...         },
+...         {
+...             "playlist_id": playlist_id,
+...             "song_id": "3cf3958c-39bc-4d2f-b86e-06546053017e",
+...             "position": 4,
+...             "added_by": "56db9ce4-ee3b-4f97-8418-88459b35cefc",
+...         },
+...     ],
+... )
+<sqlalchemy.engine.cursor.CursorResult object at 0x7d8fe0302270>
+>>> 
+>>> db.session.commit()
+>>> # Verify the playlist actually has four songs
+>>> for song in playlist.songs:
+...     print("-", song.title)
+... 
+- Block Party
+- Midnight Drive
+- Still Waters
+- First Light
+>>> print("Relationship count:", len(playlist.songs))
+Relationship count: 4
+>>> songs = get_playlist_songs(playlist_id)
+>>> print("\nSongs returned by get_playlist_songs():")
+>>> # Call the function under test
+
+Songs returned by get_playlist_songs():
+>>> for song in songs:
+...     print("-", song["title"])
+... 
+- Midnight Drive
+- Still Waters
+- First Light
+>>> print("Returned count:", len(songs))
+Returned count: 3
+>>> 
+
+## How I Found the Root Cause
+
+Files examined: `routes/playlists.py` (to confirm the songs endpoint calls
+`get_playlist_songs()`), then `services/playlist_service.py`. The function
+builds an ORM query ordered by `asc(playlist_entries.c.position)` and
+assigns it to `songs` — that part matched the docstring exactly. The final
+line was `return [song.to_dict() for song in songs[:-1]]`. `songs[:-1]`
+is a Python slice that always drops the last element of whatever list
+precedes it, unconditionally — that slice, not the query or the ordering,
+was the exact cause, since the docstring for the same function explicitly
+states "this function returns all songs in the playlist."
+
+## Root Cause
+
+`get_playlist_songs()` in `services/playlist_service.py` correctly
+queries and orders all playlist entries by position, but its return
+statement applied `songs[:-1]` to the ordered list before converting to
+dicts. `[:-1]` always excludes the last element of a list regardless of
+its length, so the highest-position song in every playlist — the one most
+recently added — was silently dropped from every call, even though
+nothing in the query itself limited or excluded it.
+
+## Fix
+
+Changed `return [song.to_dict() for song in songs[:-1]]` to `return
+[song.to_dict() for song in songs]` in `services/playlist_service.py`,
+so the full ordered list is returned as the docstring describes.
+
+## Verification
+
+```
+1-song playlist -> ['Song 0'] (expect 1 song, not 0)
+4-song playlist -> ['Song 0', 'Song 1', 'Song 2', 'Song 3'] (expect all 4, ending Song 3)
+```
+
+Checked the single-song boundary specifically, since `songs[:-1]` on a
+1-element list previously returned an empty list (the most extreme case
+of the bug) — it now correctly returns that one song. Also re-checked the
+4-song case ends with the last-added song instead of stopping short.
+Checked `get_playlist()` and `get_user_playlists()` in the same file —
+neither touches `songs[:-1]` or depends on `get_playlist_songs()`'s
+return value, so they're unaffected. Full `pytest tests/` suite (13
+tests) still passes.
+
+## Commit
+
+`fix: return full song list instead of dropping last playlist entry`
+
+---
+
+# Regression Test (Stretch)
+
+*(Describe the regression test you added and why it would have caught the bug.)*
+
+---
+
+# AI Assistance
+
+I used ChatGPT to help me understand the overall architecture of the project, explain unfamiliar functions, and organize my codebase map and bug documentation. I reproduced each bug myself, traced the relevant execution flow through the route and service layers, implemented and verified the fixes locally, and used AI as a tool for understanding the existing code rather than generating the fixes automatically.

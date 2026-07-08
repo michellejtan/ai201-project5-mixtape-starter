@@ -63,7 +63,12 @@ def get_playlist_songs(playlist_id: str) -> list[dict]:
         .all()
     )
 
-    return [song.to_dict() for song in songs[:-1]]
+    # Bug fix: `songs[:-1]` unconditionally dropped the last song in the
+    # playlist (by position). There's no reason to exclude it — the
+    # docstring itself says "this function returns all songs in the
+    # playlist" — so return the full ordered list.
+    # return [song.to_dict() for song in songs[:-1]]
+    return [song.to_dict() for song in songs]
 
 
 def get_playlist(playlist_id: str) -> dict:
